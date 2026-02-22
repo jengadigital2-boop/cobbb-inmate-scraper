@@ -1,0 +1,17 @@
+{
+  "name": "cobb-inmate-scraper",
+  "version": "1.0.0",
+  "description": "Playwright microservice for Cobb County inmate search",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "postinstall": "npx playwright install chromium --with-deps"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "playwright": "^1.41.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
