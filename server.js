@@ -30,7 +30,7 @@ app.post('/scrape', async (req, res) => {
     });
     const page = await context.newPage();
 
-    console.log(`[scrape] Starting search for: ${name}`);
+    console.log(`[scrape] Starting: ${name}`);
     await page.goto('http://inmate-search.cobbsheriff.org/enter_name.shtm', { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.goto(
       `http://inmate-search.cobbsheriff.org/inquiry.asp?soid=&inmate_name=${encodeURIComponent(name)}&serial=&qry=${mode}`,
@@ -43,7 +43,8 @@ app.post('/scrape', async (req, res) => {
       for (const row of rows) {
         const cells = Array.from(row.querySelectorAll('td')).map(c => c.innerText.trim());
         if (cells.length >= 6 && /^\d{9}$/.test(cells[6] || '')) {
-          inmates.push({ name: cells[1]||'', dob: cells[2]||'', race: cells[3]||'', sex: cells[4]||'', location: cells[5]||'', soid: cells[6]||'', daysInCustody: cells[7]||'' });
+          inmates.push({ name: cells[1]||'', dob: cells[2]||'', race: cells[3]||'',
+            sex: cells[4]||'', location: cells[5]||'', soid: cells[6]||'', daysInCustody: cells[7]||'' });
         }
       }
       return inmates;
@@ -57,12 +58,12 @@ app.post('/scrape', async (req, res) => {
     const firstInmate = listData[0];
     console.log(`[scrape] Found: ${firstInmate.name} (SOID: ${firstInmate.soid})`);
 
+    // Navigate to detail page
     let clickError = null;
     try {
       const allButtons = await page.evaluate(() =>
         Array.from(document.querySelectorAll('input, button, a')).map(el => ({
-          onclick: el.getAttribute('onclick') || '', href: el.href || '',
-          value: el.value || '', text: el.innerText || ''
+          onclick: el.getAttribute('onclick') || '', href: el.href || ''
         }))
       );
       let bookingId = '';
@@ -84,158 +85,215 @@ app.post('/scrape', async (req, res) => {
     const detailUrl = page.url();
     const pageTitle = await page.title();
     const isDetailPage = detailUrl.includes('InmDetails');
-    console.log(`[scrape] isDetail: ${isDetailPage}`);
+    console.log(`[scrape] isDetail: ${isDetailPage}, URL: ${detailUrl}`);
 
     let bookingData = null;
 
     if (isDetailPage) {
-      // Pull raw rows out of browser context
-      const rawRows = await page.evaluate(() => {
-        const clean = s => (s||'').replace(/\s+/g,' ').trim();
-        return Array.from(document.querySelectorAll('table tr')).map(row => ({
-          isHeader: row.querySelectorAll('th').length > 0,
-          cells: Array.from(row.querySelectorAll('td,th')).map(c => clean(c.innerText))
-        })).filter(r => r.cells.some(c => c));
+      // Parse the entire page in browser context with full structural awareness
+      bookingData = await page.evaluate(() => {
+        const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+
+        const result = {
+          // Booking fields
+          agencyId: '', arrestDate: '', bookingStarted: '', bookingComplete: '',
+          // Physical
+          height: '', weight: '', hair: '', eyes: '',
+          // Personal
+          address: '', city: '', state: '', zip: '', placeOfBirth: '',
+          // Case
+          locationOfArrest: '', courtroom: '', courtCaseNumber: '',
+          // Release
+          attorney: '', releaseDate: '', releasedTo: '', bondStatus: '',
+          // Charges array
+          charges: [],
+          // Debug
+          rawKvKeys: []
+        };
+
+        // ── SECTION 1: Parse all simple key→value pairs from the top of the page ──
+        // These are 2-col or 4-col rows with th headers followed by td values
+        const allRows = Array.from(document.querySelectorAll('table tr'));
+        const kv = {};
+        let lastHeaders = [];
+
+        for (const row of allRows) {
+          const ths = Array.from(row.querySelectorAll('th')).map(c => clean(c.innerText));
+          const tds = Array.from(row.querySelectorAll('td')).map(c => clean(c.innerText));
+
+          if (ths.length > 0 && tds.length === 0) {
+            // Pure header row — store for next value row
+            lastHeaders = ths.map(h => h.toLowerCase().replace(/:$/, '').trim());
+            continue;
+          }
+
+          if (lastHeaders.length > 0 && tds.length > 0) {
+            lastHeaders.forEach((h, i) => {
+              if (h && tds[i] !== undefined && tds[i] !== '') kv[h] = tds[i];
+            });
+            lastHeaders = [];
+            continue;
+          }
+
+          // Mixed th+td in same row (label:value inline)
+          if (ths.length > 0 && tds.length > 0) {
+            // pair them: th[0]→td[0], th[1]→td[1], etc.
+            ths.forEach((h, i) => {
+              if (h && tds[i]) kv[h.toLowerCase().replace(/:$/, '').trim()] = tds[i];
+            });
+            continue;
+          }
+
+          // Pure td rows: 2-col or 4-col kv
+          if (tds.length === 2 && tds[0] && tds[1]) {
+            kv[tds[0].toLowerCase().replace(/:$/, '').trim()] = tds[1];
+          } else if (tds.length >= 4) {
+            if (tds[0] && tds[1]) kv[tds[0].toLowerCase().replace(/:$/, '').trim()] = tds[1];
+            if (tds[2] && tds[3]) kv[tds[2].toLowerCase().replace(/:$/, '').trim()] = tds[3];
+          }
+        }
+
+        result.rawKvKeys = Object.keys(kv);
+
+        const get = (...keys) => {
+          for (const k of keys) {
+            if (kv[k]) return kv[k];
+            const fk = Object.keys(kv).find(x => x.includes(k.toLowerCase()));
+            if (fk) return kv[fk];
+          }
+          return '';
+        };
+
+        // ── SECTION 2: Map known fields ──
+        result.agencyId        = get('arrest agency', 'agency id');
+        result.arrestDate      = get('arrest date/time', 'arrest date');
+        result.bookingStarted  = get('booking started');
+        result.bookingComplete = get('booking complete');
+        result.height          = get('height');
+        result.weight          = get('weight');
+        result.hair            = get('hair');
+        result.eyes            = get('eyes');
+        result.address         = get('address');
+        result.city            = get('city');
+        result.state           = get('state');
+        result.zip             = get('zip');
+        result.placeOfBirth    = get('place of birth');
+        result.locationOfArrest = get('location of arrest');
+        result.courtroom       = get('superior courtroom', 'courtroom');
+        result.bondStatus      = get('bond status');
+        result.releaseDate     = get('release date');
+        result.releasedTo      = get('released to');
+
+        // ── SECTION 3: Attorney — look for the specific cell text ──
+        const allCells = Array.from(document.querySelectorAll('td, th')).map(c => clean(c.innerText));
+        const attyIdx = allCells.findIndex(c => c.toLowerCase() === 'attorney');
+        if (attyIdx >= 0 && allCells[attyIdx + 1]) {
+          result.attorney = allCells[attyIdx + 1];
+        } else {
+          result.attorney = get('attorney', 'public defender', 'counsel');
+        }
+
+        // ── SECTION 4: Parse Charges table structurally ──
+        // The charges section looks like:
+        // Row: [Warrant] [24-WD-NA46] [Warrant Date] [2/13/2026] [1]
+        // Row: [Case] [24CR02977-AGP] [OTN] []
+        // Row: [Offense Date] [Code Section] [Description] [Type] [Counts] [Bond]  ← header
+        // Row: [N/A] [OCGA16-8-2] [Theft by Taking (Felony)] [Felony Indicted] [1] [$0.00]  ← data
+        // Row: [Disposition] [Felony Sentence]
+        // Row: [Bond Amount] [$0.00]
+        // Row: [Bond Status] [Sentenced/NO BOND] [$0.00]
+
+        const charges = [];
+        let currentCharge = null;
+        let inChargesSection = false;
+        let chargeRowHeaders = [];
+
+        for (const row of allRows) {
+          const cells = Array.from(row.querySelectorAll('td, th')).map(c => clean(c.innerText)).filter(c => c);
+          const cellsLower = cells.map(c => c.toLowerCase());
+          const joined = cellsLower.join(' ');
+
+          // Detect start of charges section
+          if (!inChargesSection && joined === 'charges') {
+            inChargesSection = true;
+            continue;
+          }
+          if (!inChargesSection) continue;
+
+          // Detect end of charges section
+          if (joined.includes('release information') || joined.includes('not released')) {
+            if (currentCharge) charges.push(currentCharge);
+            currentCharge = null;
+            break;
+          }
+
+          // Warrant row starts a new charge group
+          if (cellsLower[0] === 'warrant' && cells[1] && cells[1] !== 'Date') {
+            if (currentCharge) charges.push(currentCharge);
+            currentCharge = { warrant: cells[1], warrantDate: cells[3] || '', counts: cells[4] || '' };
+            continue;
+          }
+
+          // Case row
+          if (cellsLower[0] === 'case' && currentCharge) {
+            currentCharge.caseNumber = cells[1] || '';
+            continue;
+          }
+
+          // Charge header row: Offense Date | Code Section | Description | Type | Counts | Bond
+          if (cellsLower.includes('offense date') && cellsLower.includes('description')) {
+            chargeRowHeaders = cellsLower;
+            continue;
+          }
+
+          // Charge data row (follows header row)
+          if (chargeRowHeaders.length > 0 && currentCharge && cells.length >= 3) {
+            const offIdx = chargeRowHeaders.indexOf('offense date');
+            const codeIdx = chargeRowHeaders.indexOf('code section');
+            const descIdx = chargeRowHeaders.indexOf('description');
+            const typeIdx = chargeRowHeaders.indexOf('type');
+            const cntIdx = chargeRowHeaders.indexOf('counts');
+            const bondIdx = chargeRowHeaders.indexOf('bond');
+
+            if (offIdx >= 0)  currentCharge.offenseDate  = cells[offIdx] || '';
+            if (codeIdx >= 0) currentCharge.statute       = cells[codeIdx] || '';
+            if (descIdx >= 0) currentCharge.description   = cells[descIdx] || '';
+            if (typeIdx >= 0) currentCharge.type          = cells[typeIdx] || '';
+            if (cntIdx >= 0)  currentCharge.counts        = cells[cntIdx] || '';
+            if (bondIdx >= 0) currentCharge.bond          = cells[bondIdx] || '';
+            chargeRowHeaders = [];
+            continue;
+          }
+
+          // Disposition row
+          if (cellsLower[0] === 'disposition' && currentCharge) {
+            currentCharge.disposition = cells[1] || cells.slice(1).join(' ') || '';
+            continue;
+          }
+
+          // Bond amount row
+          if (joined.includes('bond amount') && currentCharge) {
+            currentCharge.bondAmount = cells[cells.length - 1] || '';
+            continue;
+          }
+
+          // Bond status row
+          if (joined.includes('bond status') && currentCharge) {
+            currentCharge.bondStatus = cells.find(c => c && !c.toLowerCase().includes('bond status') && c !== '$0.00') || '';
+            currentCharge.bondAmount = currentCharge.bondAmount || cells[cells.length - 1] || '';
+            continue;
+          }
+        }
+
+        if (currentCharge) charges.push(currentCharge);
+        result.charges = charges;
+
+        return result;
       });
 
-      // ── Key insight from KV dump:
-      // The site layout is: HEADER ROW (th cells) followed immediately by VALUE ROW (td cells)
-      // Headers and values are in SEPARATE rows, not the same row
-      // So we need to pair consecutive header+value rows
-      
-      const kv = {};
-      let pendingHeaders = [];
-
-      for (const row of rawRows) {
-        const cells = row.cells.filter(c => c); // remove empty cells
-
-        if (row.isHeader) {
-          // Store these as pending headers waiting for next value row
-          pendingHeaders = cells.map(h => h.toLowerCase().replace(/:$/,'').trim());
-          continue;
-        }
-
-        if (pendingHeaders.length > 0 && cells.length > 0) {
-          // Map value cells to pending headers
-          pendingHeaders.forEach((h, i) => {
-            if (h && cells[i] !== undefined) kv[h] = cells[i];
-          });
-          pendingHeaders = [];
-          continue;
-        }
-
-        // Also handle 2-col and 4-col non-header rows as direct kv pairs
-        if (cells.length === 2 && cells[0] && cells[1]) {
-          kv[cells[0].toLowerCase().replace(/:$/,'').trim()] = cells[1];
-        } else if (cells.length >= 4) {
-          if (cells[0] && cells[1]) kv[cells[0].toLowerCase().replace(/:$/,'').trim()] = cells[1];
-          if (cells[2] && cells[3]) kv[cells[2].toLowerCase().replace(/:$/,'').trim()] = cells[3];
-        }
-      }
-
-      // Log every KV pair
-      console.log('[scrape] === KV DUMP ===');
-      Object.entries(kv).forEach(([k,v]) => console.log(`  "${k}" => "${v}"`));
-      console.log('[scrape] === END KV ===');
-
-      const get = (...keys) => {
-        for (const k of keys) {
-          if (kv[k]) return kv[k];
-          const fk = Object.keys(kv).find(x => x.includes(k.toLowerCase()));
-          if (fk) return kv[fk];
-        }
-        return '';
-      };
-
-      // ── Parse charges
-      // From KV dump we know charges appear as rows with these keys:
-      // "case", "offense date", "description"(=charge name), "n/a"(=statute),
-      // "theft by taking (felony)"(=actual charge text) => "Felony Indicted"(=type)
-      // "disposition", "bond amount"
-      // Strategy: group rows between "case" markers
-      const charges = [];
-      const kvEntries = Object.entries(kv);
-      
-      // Find all "case" entry indices as charge group boundaries
-      const caseIndices = kvEntries.reduce((acc, [k], i) => {
-        if (k === 'case') acc.push(i);
-        return acc;
-      }, []);
-
-      console.log(`[scrape] Found ${caseIndices.length} charge groups`);
-
-      if (caseIndices.length > 0) {
-        for (let ci = 0; ci < caseIndices.length; ci++) {
-          const start = caseIndices[ci];
-          const end = caseIndices[ci + 1] || kvEntries.length;
-          const group = Object.fromEntries(kvEntries.slice(start, end));
-          
-          // The charge description is the key that isn't a known field name
-          const knownKeys = ['case','offense date','description','n/a','disposition','bond amount','warrant','warrant date','type','code section'];
-          const chargeKey = Object.keys(group).find(k =>
-            !knownKeys.some(kn => k.includes(kn)) &&
-            k !== 'case' && group[k] && group[k].length > 2
-          );
-          
-          const charge = {
-            description: chargeKey ? `${chargeKey} — ${group[chargeKey]}` : get('description'),
-            caseNumber:  group['case'] || '',
-            offenseDate: group['offense date'] || '',
-            statute:     group['n/a'] || group['code section'] || '',
-            disposition: group['disposition'] || '',
-            bond:        group['bond amount'] || '',
-            warrant:     group['warrant'] || '',
-            warrantDate: group['warrant date'] || '',
-            type:        chargeKey ? group[chargeKey] : ''
-          };
-
-          // If chargeKey found, use it as the main description
-          if (chargeKey) {
-            charge.description = chargeKey;
-            charge.type = group[chargeKey];
-          }
-
-          charges.push(charge);
-          console.log(`[scrape] Charge ${ci+1}: ${JSON.stringify(charge)}`);
-        }
-      } else {
-        // Fallback: look for any key that matches charge-like patterns
-        kvEntries.forEach(([k, v]) => {
-          if (k.includes('theft') || k.includes('assault') || k.includes('battery') ||
-              k.includes('drug') || k.includes('murder') || k.includes('robbery') ||
-              k.includes('burglary') || k.includes('fraud') || k.includes('dui') ||
-              (v && (v.toLowerCase().includes('felony') || v.toLowerCase().includes('misdemeanor')))) {
-            charges.push({ description: k, type: v, bond: get('bond amount') });
-            console.log(`[scrape] Fallback charge: ${k} => ${v}`);
-          }
-        });
-      }
-
-      bookingData = {
-        agencyId:         get('ga0330000', 'arrest agency', 'agency id', 'agency'),
-        arrestDate:       get('arrest date/time', 'arrest date'),
-        offenseDate:      get('offense date'),
-        bookingStarted:   get('booking started'),
-        bookingComplete:  get('booking complete'),
-        height:           get('height'),
-        weight:           get('weight'),
-        hair:             get('hair'),
-        eyes:             get('eyes'),
-        address:          get('address'),
-        city:             get('city'),
-        state:            get('state'),
-        zip:              get('zip'),
-        placeOfBirth:     get('place of birth'),
-        locationOfArrest: get('location of arrest'),
-        courtroom:        get('superior courtroom', 'courtroom'),
-        attorney:         get('attorney', 'public defender', 'counsel'),
-        warrant:          get('warrant'),
-        warrantDate:      get('warrant date'),
-        charges,
-        rawKvKeys: Object.keys(kv)
-      };
-
-      console.log(`[scrape] Final — arrestDate:${bookingData.arrestDate} height:${bookingData.height} weight:${bookingData.weight} attorney:${bookingData.attorney} charges:${charges.length}`);
+      // Log final result
+      console.log(`[scrape] arrestDate:${bookingData.arrestDate} height:${bookingData.height} weight:${bookingData.weight} attorney:${bookingData.attorney} charges:${bookingData.charges.length} bondStatus:${bookingData.bondStatus} releaseDate:${bookingData.releaseDate}`);
+      bookingData.charges.forEach((c, i) => console.log(`[scrape] Charge ${i+1}: ${JSON.stringify(c)}`));
     }
 
     await browser.close();
