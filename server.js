@@ -245,16 +245,53 @@ app.post('/scrape', async (req, res) => {
 
         const get = (...keys) => {
           for (const k of keys) {
+            // Exact match first
             if (kv[k]) return kv[k];
+            // Partial match
             const fk = Object.keys(kv).find(x => x.includes(k.toLowerCase()));
             if (fk) return kv[fk];
           }
           return '';
         };
 
+        // Fix offset issue: the site layout has headers and values in adjacent rows
+        // Re-parse specifically looking for the physical description block
+        // by scanning for known header patterns
+        const allText = Object.entries(kv).map(([k,v]) => `${k}::${v}`).join(' | ');
+        console.log('[scrape] KV pairs:', allText);
+
+        // ── Charges: this site uses a flat list of fields per charge ──
+        // Keys seen: 'offense date', 'description', 'bond amount', 'case',
+        // 'warrant', 'warrant date', 'disposition', 'location of arrest'
+        // Charges are NOT in a traditional table — they're flat kv rows.
+        // We'll collect them by scanning for 'description' keys and pairing with nearby fields.
+        const chargesFinal = [];
+        const kvEntries = Object.entries(kv);
+        for (let i = 0; i < kvEntries.length; i++) {
+          const [k, v] = kvEntries[i];
+          if (k === 'description' || k.includes('description')) {
+            // Found a charge description — grab surrounding fields
+            const charge = { description: v };
+            // Look back and ahead for related fields
+            for (let j = Math.max(0, i-3); j < Math.min(kvEntries.length, i+5); j++) {
+              const [kj, vj] = kvEntries[j];
+              if (kj.includes('bond')) charge.bond = vj;
+              if (kj.includes('offense date') || kj.includes('offense')) charge.offenseDate = vj;
+              if (kj.includes('warrant') && !kj.includes('date')) charge.warrant = vj;
+              if (kj.includes('case')) charge.case = vj;
+              if (kj.includes('disposition')) charge.disposition = vj;
+              if (kj.includes('statute')) charge.statute = vj;
+            }
+            chargesFinal.push(charge);
+          }
+        }
+
+        // Also keep old charge table parsing as fallback
+        const finalCharges = chargesFinal.length > 0 ? chargesFinal : charges;
+
         return {
-          agencyId:        get('agency id', 'agency'),
-          arrestDate:      get('arrest date/time', 'arrest date', 'arrest'),
+          agencyId:        get('arrest agency', 'agency id', 'agency'),
+          arrestDate:      get('offense date', 'arrest date/time', 'arrest date'),
           bookingStarted:  get('booking started', 'booking start'),
           bookingComplete: get('booking complete', 'booking end'),
           height:          get('height'),
@@ -265,9 +302,11 @@ app.post('/scrape', async (req, res) => {
           city:            get('city'),
           state:           get('state'),
           zip:             get('zip'),
-          placeOfBirth:    get('place of birth', 'birth'),
-          charges,
-          rawKvKeys:       Object.keys(kv)  // debug
+          placeOfBirth:    get('place of birth'),
+          courtroom:       get('superior courtroom', 'courtroom', 'court'),
+          locationOfArrest: get('location of arrest'),
+          charges:         finalCharges,
+          rawKvKeys:       Object.keys(kv)  // debug — remove once stable
         };
       });
     }
