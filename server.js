@@ -89,46 +89,88 @@ app.post('/scrape', async (req, res) => {
     console.log(`[scrape] Found: ${firstInmate.name} (SOID: ${firstInmate.soid})`);
 
     // ── Step 4: Click "Last Known Booking" button ───────────
-    // This is the JS button that ScraperAPI couldn't handle —
-    // Playwright clicks it for real and follows the navigation
     let bookingData = null;
     let clickError = null;
 
     try {
-      // The button text varies — try common labels
-      const btnSelectors = [
-        'input[value*="Last Known"]',
-        'input[value*="Booking"]',
-        'a:has-text("Last Known")',
-        'button:has-text("Booking")',
-        'input[type="submit"]',
-        'input[type="button"]'
-      ];
+      // Dump all buttons/inputs on the page for debugging
+      const allButtons = await page.evaluate(() => {
+        const inputs = Array.from(document.querySelectorAll('input, button, a'));
+        return inputs.map(el => ({
+          tag: el.tagName,
+          type: el.type || '',
+          value: el.value || '',
+          text: el.innerText || '',
+          onclick: el.getAttribute('onclick') || '',
+          href: el.href || ''
+        }));
+      });
+      console.log('[scrape] All clickable elements:', JSON.stringify(allButtons));
 
-      let clicked = false;
-      for (const sel of btnSelectors) {
-        try {
-          const btn = await page.$(sel);
-          if (btn) {
-            await Promise.all([
-              page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }),
-              btn.click()
-            ]);
-            clicked = true;
-            console.log(`[scrape] Clicked booking button via selector: ${sel}`);
-            break;
-          }
-        } catch (e) { /* try next selector */ }
+      // Try to find and extract BOOKING_ID from any onclick handlers
+      let bookingId = '';
+      let soidFromPage = firstInmate.soid;
+      for (const el of allButtons) {
+        const combined = el.onclick + el.href + el.value + el.text;
+        const bidMatch = combined.match(/BOOKING_ID[=,\s'"]+(\d{10,})/i);
+        if (bidMatch) { bookingId = bidMatch[1]; break; }
+        const longNum = combined.match(/[^\d](\d{14,})[^\d]/);
+        if (longNum) { bookingId = longNum[1]; break; }
       }
 
-      if (!clicked) {
-        // Fallback: build InmDetails URL directly with padded SOID
-        const paddedSoid = firstInmate.soid + '    '; // 4 trailing spaces
-        const detailUrl = `http://inmate-search.cobbsheriff.org/InmDetails.asp?soid=${encodeURIComponent(paddedSoid)}`;
-        console.log(`[scrape] Button not found, navigating directly: ${detailUrl}`);
+      if (bookingId) {
+        // We found a BOOKING_ID — navigate directly to the detail page
+        const paddedSoid = soidFromPage + '    ';
+        const detailUrl = `http://inmate-search.cobbsheriff.org/InmDetails.asp?soid=${encodeURIComponent(paddedSoid)}&BOOKING_ID=${bookingId}`;
+        console.log(`[scrape] Navigating directly with BOOKING_ID: ${detailUrl}`);
         await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      }
+      } else {
+        // No BOOKING_ID found — try clicking every button and check if we land on detail page
+        const btnSelectors = [
+          'input[value*="Last Known"]',
+          'input[value*="Booking"]',
+          'input[value*="Detail"]',
+          'input[value*="View"]',
+          'a:has-text("Last Known")',
+          'a:has-text("Booking")',
+          'button:has-text("Booking")',
+          'input[type="submit"]',
+          'input[type="button"]'
+        ];
 
+        let clicked = false;
+        for (const sel of btnSelectors) {
+          try {
+            const btn = await page.$(sel);
+            if (btn) {
+              const val = await btn.evaluate(el => el.value || el.innerText || '');
+              console.log(`[scrape] Trying button: ${sel} = "${val}"`);
+              await Promise.all([
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }),
+                btn.click()
+              ]);
+              // Check if we landed on the detail page
+              const newUrl = page.url();
+              if (newUrl.includes('InmDetails')) {
+                clicked = true;
+                console.log(`[scrape] Success! Landed on: ${newUrl}`);
+                break;
+              }
+            }
+          } catch (e) {
+            console.log(`[scrape] Button attempt failed: ${sel} — ${e.message}`);
+          }
+        }
+
+        if (!clicked) {
+          // Last resort: try the SOID-only URL with a fresh page load
+          // The site sometimes accepts this if a session exists
+          const paddedSoid = soidFromPage + '    ';
+          const fallbackUrl = `http://inmate-search.cobbsheriff.org/InmDetails.asp?soid=${encodeURIComponent(paddedSoid)}`;
+          console.log(`[scrape] All buttons failed, trying SOID-only URL: ${fallbackUrl}`);
+          await page.goto(fallbackUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        }
+      }
     } catch (e) {
       clickError = e.message;
       console.error(`[scrape] Navigation error: ${e.message}`);
