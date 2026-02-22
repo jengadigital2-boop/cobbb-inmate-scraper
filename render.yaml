@@ -1,10 +1,9 @@
 services:
   - type: web
     name: cobb-inmate-scraper
-    env: node
+    env: docker          # KEY CHANGE: Docker instead of node runtime
     plan: free
-    buildCommand: npm install
-    startCommand: npm start
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: AUTH_TOKEN
         generateValue: true   # Render auto-generates a random secret — copy it after deploy
