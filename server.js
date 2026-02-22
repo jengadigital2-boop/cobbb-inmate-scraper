@@ -37,6 +37,7 @@ app.post('/scrape', async (req, res) => {
       { waitUntil: 'domcontentloaded', timeout: 30000 }
     );
 
+    // Parse results list
     const listData = await page.evaluate(() => {
       const rows = Array.from(document.querySelectorAll('table tr'));
       const inmates = [];
@@ -58,6 +59,7 @@ app.post('/scrape', async (req, res) => {
     const firstInmate = listData[0];
     console.log(`[scrape] Found: ${firstInmate.name} (SOID: ${firstInmate.soid})`);
 
+    // Navigate to detail page
     let clickError = null;
     try {
       const allButtons = await page.evaluate(() =>
@@ -70,11 +72,11 @@ app.post('/scrape', async (req, res) => {
         const m = (el.onclick + el.href).match(/BOOKING_ID[=,\s'"]+(\d{10,})/i);
         if (m) { bookingId = m[1]; break; }
       }
-      console.log(`[scrape] BOOKING_ID: ${bookingId || 'none'}`);
       const paddedSoid = firstInmate.soid + '    ';
       const dest = bookingId
         ? `http://inmate-search.cobbsheriff.org/InmDetails.asp?soid=${encodeURIComponent(paddedSoid)}&BOOKING_ID=${bookingId}`
         : `http://inmate-search.cobbsheriff.org/InmDetails.asp?soid=${encodeURIComponent(paddedSoid)}`;
+      console.log(`[scrape] Going to: ${dest}`);
       await page.goto(dest, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } catch (e) {
       clickError = e.message;
@@ -82,188 +84,48 @@ app.post('/scrape', async (req, res) => {
     }
 
     const detailUrl = page.url();
-    const pageTitle = await page.title();
     const isDetailPage = detailUrl.includes('InmDetails');
-    console.log(`[scrape] isDetail: ${isDetailPage}`);
 
-    let bookingData = null;
+    let pageData = null;
 
     if (isDetailPage) {
-      bookingData = await page.evaluate(() => {
+      // ── Collect EVERYTHING from the page ──
+      // Return raw rows + full page text so n8n can route as needed
+      pageData = await page.evaluate(() => {
         const clean = s => (s || '').replace(/\s+/g, ' ').trim();
-        const allRows = Array.from(document.querySelectorAll('table tr'));
 
-        // ── Dump ALL cells for Node-side debugging ──
-        const allCellDump = allRows.map(row => ({
-          isHeader: row.querySelectorAll('th').length > 0,
-          cells: Array.from(row.querySelectorAll('td,th')).map(c => clean(c.innerText))
-        })).filter(r => r.cells.some(c => c));
+        // 1. Full page text (for simple regex extraction in n8n if needed)
+        const fullText = clean(document.body.innerText);
 
-        // ── Pass 1: Build flat KV from header+value row pairs ──
-        const kv = {};
-        let pendingHeaders = [];
-        for (const row of allCellDump) {
-          const { isHeader, cells } = row;
-          if (isHeader && cells.every(c => !c.match(/^\d/) && c.length < 60)) {
-            pendingHeaders = cells.map(h => h.toLowerCase().replace(/:$/, '').trim());
-            continue;
-          }
-          if (pendingHeaders.length > 0 && cells.length > 0) {
-            pendingHeaders.forEach((h, i) => { if (h && cells[i]) kv[h] = cells[i]; });
-            pendingHeaders = [];
-            continue;
-          }
-          if (cells.length === 2 && cells[0] && cells[1])
-            kv[cells[0].toLowerCase().replace(/:$/, '').trim()] = cells[1];
-          else if (cells.length >= 4) {
-            if (cells[0] && cells[1]) kv[cells[0].toLowerCase().replace(/:$/, '').trim()] = cells[1];
-            if (cells[2] && cells[3]) kv[cells[2].toLowerCase().replace(/:$/, '').trim()] = cells[3];
-          }
-        }
+        // 2. All table rows as arrays of cell text
+        const allRows = Array.from(document.querySelectorAll('table tr')).map(row => {
+          return Array.from(row.querySelectorAll('td, th')).map(c => clean(c.innerText)).filter(c => c);
+        }).filter(r => r.length > 0);
 
-        const get = (...keys) => {
-          for (const k of keys) {
-            if (kv[k]) return kv[k];
-            const fk = Object.keys(kv).find(x => x.includes(k.toLowerCase()));
-            if (fk) return kv[fk];
-          }
-          return '';
-        };
+        // 3. Flat list of every non-empty cell in order
+        const allCells = Array.from(document.querySelectorAll('td, th'))
+          .map(c => clean(c.innerText))
+          .filter(c => c);
 
-        // ── Pass 2: Structural charge parsing ──
-        const charges = [];
-        let currentCharge = null;
-        let inChargesSection = false;
-        let inReleaseSection = false;
-        let chargeColHeaders = [];
-        let attorney = '';
-        let releaseDate = '';
-        let releasedTo = '';
-        let bondStatus = '';
-
-        for (const { isHeader, cells } of allCellDump) {
-          if (!cells.some(c => c)) continue;
-          const joined = cells.join(' ').toLowerCase();
-
-          // Section markers
-          if (joined.trim() === 'charges') { inChargesSection = true; inReleaseSection = false; continue; }
-          if (joined.includes('release information')) { 
-            if (currentCharge) { charges.push(currentCharge); currentCharge = null; }
-            inChargesSection = false; inReleaseSection = true; continue; 
-          }
-
-          // ── Release section ──
-          if (inReleaseSection) {
-            if (joined.trim() === 'attorney' || joined.includes('attorney')) {
-              // Next non-empty row is attorney value
-              continue;
-            }
-            if (cells.length === 1 && cells[0] && !cells[0].toLowerCase().includes('attorney') && !attorney) {
-              attorney = cells[0];
-              continue;
-            }
-            if (joined.includes('release date') || joined.includes('officer') || joined.includes('released to')) continue;
-            if (joined.includes('not released')) { releaseDate = 'Not Released'; releasedTo = 'Not Released'; continue; }
-            if (cells[0] && cells[0].match(/\d{1,2}\/\d{1,2}\/\d{4}/)) releaseDate = cells[0];
-            if (cells.length >= 3 && cells[2]) releasedTo = cells[2];
-            continue;
-          }
-
-          // ── Charges section ──
-          if (inChargesSection) {
-            // Warrant row
-            if (cells[0].toLowerCase() === 'warrant' && cells[1] && !cells[1].toLowerCase().includes('date')) {
-              if (currentCharge) charges.push(currentCharge);
-              currentCharge = { warrant: cells[1], warrantDate: cells[3] || '', counts: cells[4] || '' };
-              continue;
-            }
-            // Case row
-            if (cells[0].toLowerCase() === 'case' && currentCharge) {
-              currentCharge.caseNumber = cells[1] || '';
-              continue;
-            }
-            // Charge column headers
-            if (joined.includes('offense date') && joined.includes('description')) {
-              chargeColHeaders = cells.map(c => c.toLowerCase());
-              continue;
-            }
-            // Charge data row
-            if (chargeColHeaders.length > 0 && currentCharge && cells.length >= 3) {
-              const idx = h => chargeColHeaders.findIndex(c => c.includes(h));
-              const g = h => { const i = idx(h); return i >= 0 ? cells[i] || '' : ''; };
-              currentCharge.offenseDate  = g('offense date') || currentCharge.offenseDate || '';
-              currentCharge.statute      = g('code section');
-              currentCharge.description  = g('description');
-              currentCharge.type         = g('type');
-              currentCharge.counts       = g('count') || currentCharge.counts || '';
-              currentCharge.bond         = g('bond');
-              chargeColHeaders = [];
-              continue;
-            }
-            // Disposition
-            if (cells[0].toLowerCase() === 'disposition' && currentCharge) {
-              currentCharge.disposition = cells.slice(1).filter(Boolean).join(' ') || cells[1] || '';
-              continue;
-            }
-            // Bond amount
-            if (joined.includes('bond amount')) {
-              if (currentCharge) currentCharge.bondAmount = cells[cells.length - 1] || '';
-              continue;
-            }
-            // Bond status
-            if (joined.includes('bond status')) {
-              bondStatus = cells.find(c => c && !c.toLowerCase().includes('bond') && !c.match(/^\$/) ) || '';
-              if (currentCharge) currentCharge.bondStatus = bondStatus;
-              if (currentCharge) currentCharge.bondAmount = currentCharge.bondAmount || cells[cells.length-1] || '';
-              continue;
-            }
-          }
-        }
-
-        // Capture attorney from full cell scan if missed above
-        if (!attorney) {
-          const allFlatCells = allCellDump.flatMap(r => r.cells);
-          const ai = allFlatCells.findIndex(c => c.toLowerCase() === 'attorney');
-          if (ai >= 0) attorney = allFlatCells[ai + 1] || '';
-        }
-
-        return {
-          agencyId:         get('arrest agency', 'agency id'),
-          arrestDate:       get('arrest date/time', 'arrest date'),
-          bookingStarted:   get('booking started'),
-          bookingComplete:  get('booking complete'),
-          height:           get('height'),
-          weight:           get('weight'),
-          hair:             get('hair'),
-          eyes:             get('eyes'),
-          address:          get('address'),
-          city:             get('city'),
-          state:            get('state'),
-          zip:              get('zip'),
-          placeOfBirth:     get('place of birth'),
-          locationOfArrest: get('location of arrest'),
-          courtroom:        get('superior courtroom', 'courtroom'),
-          attorney,
-          bondStatus,
-          releaseDate,
-          releasedTo,
-          charges,
-          rawKvKeys:        Object.keys(kv)
-        };
+        return { fullText, allRows, allCells };
       });
 
-      console.log(`[scrape] arrestDate:${bookingData.arrestDate} height:${bookingData.height} attorney:${bookingData.attorney} charges:${bookingData.charges.length} release:${bookingData.releaseDate}`);
-      bookingData.charges.forEach((c,i) => console.log(`[scrape] Charge ${i+1}: ${JSON.stringify(c)}`));
+      console.log(`[scrape] Rows collected: ${pageData.allRows.length}, Cells: ${pageData.allCells.length}`);
+      console.log(`[scrape] Full text preview: ${pageData.fullText.substring(0, 500)}`);
     }
 
     await browser.close();
 
     return res.json({
-      found: true, name, totalFound: listData.length,
+      found: true,
+      name,
+      totalFound: listData.length,
       scrapedAt: new Date().toISOString(),
-      gotDetailPage: isDetailPage, detailUrl,
-      inmate: { ...firstInmate, ...(bookingData || {}) },
-      debugInfo: { pageTitle, isDetailPage, clickError, rawKvKeys: bookingData?.rawKvKeys || [] }
+      gotDetailPage: isDetailPage,
+      detailUrl,
+      inmate: firstInmate,           // basic list data: name, dob, race, sex, soid, location
+      pageData: pageData || null,    // ALL raw page data: fullText, allRows, allCells
+      debugInfo: { isDetailPage, clickError }
     });
 
   } catch (err) {
