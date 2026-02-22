@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: cobb-inmate-scraper
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: AUTH_TOKEN
+        generateValue: true   # Render auto-generates a random secret — copy it after deploy
+      - key: PORT
+        value: 3000
