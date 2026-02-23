@@ -2,7 +2,7 @@ const express = require('express');
 const { chromium } = require('playwright');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 const PORT = process.env.PORT || 3000;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
@@ -25,7 +25,7 @@ app.post('/scrape', async (req, res) => {
 
     const { name, mode = 'Inquiry' } = req.body;
 
-    if (!name) {
+    if (!name || typeof name !== 'string') {
       return res.status(400).json({ error: 'name is required' });
     }
 
@@ -42,15 +42,18 @@ app.post('/scrape', async (req, res) => {
 
     const context = await browser.newContext({
       userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121 Safari/537.36'
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121 Safari/537.36',
     });
 
     const page = await context.newPage();
 
+    // Increase default timeout
+    page.setDefaultTimeout(90000);
+
     // 🔹 Load search page
     await page.goto(
       'http://inmate-search.cobbsheriff.org/enter_name.shtm',
-      { waitUntil: 'domcontentloaded', timeout: 60000 }
+      { waitUntil: 'domcontentloaded' }
     );
 
     // 🔹 Fill name
@@ -59,24 +62,32 @@ app.post('/scrape', async (req, res) => {
     // 🔹 Select dropdown
     await page.selectOption('select[name="qry"]', mode);
 
-    // 🔹 Submit form directly (avoids button selector issues)
+    // 🔹 Submit form safely
     await page.evaluate(() => {
       const form = document.querySelector('form');
       if (form) form.submit();
     });
 
-    // 🔹 Wait for results content (NOT navigation)
-    await page.waitForFunction(() => {
-      return (
-        document.querySelectorAll('table tr').length > 1 ||
-        document.body.innerText.includes('No matching records')
-      );
-    }, { timeout: 90000 });
+    // 🔹 Wait for page to stabilize (legacy ASP needs breathing room)
+    await page.waitForTimeout(5000);
 
-    // 🔹 Check no records
-    const noRecords = await page.evaluate(() =>
-      document.body.innerText.includes('No matching records')
-    );
+    // 🔹 Wait for either results or no-record message safely
+    await page.waitForFunction(() => {
+      const body = document.body;
+      if (!body) return false;
+
+      const rows = document.querySelectorAll('table tr');
+      const text = body.innerText || '';
+
+      return rows.length > 1 || text.includes('No matching records');
+    });
+
+    // 🔹 Check for no records
+    const noRecords = await page.evaluate(() => {
+      const body = document.body;
+      if (!body) return false;
+      return body.innerText.includes('No matching records');
+    });
 
     if (noRecords) {
       await browser.close();
@@ -89,14 +100,14 @@ app.post('/scrape', async (req, res) => {
       });
     }
 
-    // 🔹 Extract rows
+    // 🔹 Extract list results
     const inmates = await page.evaluate(() => {
       const rows = Array.from(document.querySelectorAll('table tr'));
       const results = [];
 
       for (const row of rows) {
         const cells = Array.from(row.querySelectorAll('td')).map(c =>
-          c.innerText.trim()
+          (c.innerText || '').trim()
         );
 
         if (cells.length >= 6 && /^\d{9}$/.test(cells[6] || '')) {
@@ -119,22 +130,23 @@ app.post('/scrape', async (req, res) => {
 
     const detailedResults = [];
 
-    // 🔹 Visit each detail page
-    for (const inmate of inmates) {
+    // 🔹 Visit each detail page (limit to prevent overload)
+    const MAX_DETAILS = 25;
+
+    for (const inmate of inmates.slice(0, MAX_DETAILS)) {
       try {
         const paddedSoid = inmate.soid + '    ';
         const detailUrl =
           `http://inmate-search.cobbsheriff.org/InmDetails.asp?soid=${encodeURIComponent(paddedSoid)}`;
 
-        await page.goto(detailUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout: 60000
-        });
+        await page.goto(detailUrl, { waitUntil: 'domcontentloaded' });
+
+        await page.waitForTimeout(2000);
 
         const detailData = await page.evaluate(() => {
           const clean = s => (s || '').replace(/\s+/g, ' ').trim();
 
-          const fullText = clean(document.body.innerText);
+          const fullText = clean(document.body ? document.body.innerText : '');
 
           const rows = Array.from(document.querySelectorAll('table tr'))
             .map(row =>
@@ -153,9 +165,7 @@ app.post('/scrape', async (req, res) => {
         });
 
       } catch (err) {
-        console.log(
-          `[scrape] Detail error for ${inmate.name}: ${err.message}`
-        );
+        console.log(`[scrape] Detail error for ${inmate.name}: ${err.message}`);
       }
     }
 
@@ -166,6 +176,7 @@ app.post('/scrape', async (req, res) => {
       name,
       mode,
       totalFound: inmates.length,
+      returnedDetails: detailedResults.length,
       scrapedAt: new Date().toISOString(),
       inmates: detailedResults
     });
