@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'cobb-inmate-scraper' });
+  res.json({ status: 'ok', service: 'cobb-inmate-debug' });
 });
 
 app.post('/scrape', async (req, res) => {
@@ -29,7 +29,7 @@ app.post('/scrape', async (req, res) => {
       return res.status(400).json({ error: 'name is required' });
     }
 
-    console.log(`[scrape] Searching ${mode} for: ${name}`);
+    console.log(`[DEBUG] Searching ${mode} for: ${name}`);
 
     browser = await chromium.launch({
       headless: true,
@@ -42,24 +42,20 @@ app.post('/scrape', async (req, res) => {
 
     const context = await browser.newContext({
       userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121 Safari/537.36'
     });
 
     const page = await context.newPage();
+    page.setDefaultTimeout(60000);
 
-    // Increase default timeout
-    page.setDefaultTimeout(90000);
-
-    // 🔹 Load search page
+    // 🔹 Go to search page
     await page.goto(
       'http://inmate-search.cobbsheriff.org/enter_name.shtm',
       { waitUntil: 'domcontentloaded' }
     );
 
-    // 🔹 Fill name
+    // 🔹 Fill form
     await page.fill('input[name="inmate_name"]', name);
-
-    // 🔹 Select dropdown
     await page.selectOption('select[name="qry"]', mode);
 
     // 🔹 Submit form safely
@@ -68,40 +64,20 @@ app.post('/scrape', async (req, res) => {
       if (form) form.submit();
     });
 
-    // 🔹 Wait for page to stabilize (legacy ASP needs breathing room)
-    await page.waitForTimeout(5000);
+    // 🔹 Wait a fixed amount of time (no DOM dependency)
+    await page.waitForTimeout(15000);
 
-    // 🔹 Wait for either results or no-record message safely
-    await page.waitForFunction(() => {
-      const body = document.body;
-      if (!body) return false;
+    // 🔍 DEBUG DATA
+    const currentUrl = page.url();
+    const html = await page.content();
+    const htmlLength = html.length;
 
-      const rows = document.querySelectorAll('table tr');
-      const text = body.innerText || '';
+    console.log("PAGE URL:", currentUrl);
+    console.log("PAGE LENGTH:", htmlLength);
+    console.log("PAGE PREVIEW:", html.substring(0, 800));
 
-      return rows.length > 1 || text.includes('No matching records');
-    });
-
-    // 🔹 Check for no records
-    const noRecords = await page.evaluate(() => {
-      const body = document.body;
-      if (!body) return false;
-      return body.innerText.includes('No matching records');
-    });
-
-    if (noRecords) {
-      await browser.close();
-      return res.json({
-        found: false,
-        name,
-        mode,
-        message: 'No matching records found',
-        scrapedAt: new Date().toISOString()
-      });
-    }
-
-    // 🔹 Extract list results
-    const inmates = await page.evaluate(() => {
+    // 🔎 Try to detect results safely
+    const inmateRows = await page.evaluate(() => {
       const rows = Array.from(document.querySelectorAll('table tr'));
       const results = [];
 
@@ -126,75 +102,51 @@ app.post('/scrape', async (req, res) => {
       return results;
     });
 
-    console.log(`[scrape] Found ${inmates.length} inmates`);
-
-    const detailedResults = [];
-
-    // 🔹 Visit each detail page (limit to prevent overload)
-    const MAX_DETAILS = 25;
-
-    for (const inmate of inmates.slice(0, MAX_DETAILS)) {
-      try {
-        const paddedSoid = inmate.soid + '    ';
-        const detailUrl =
-          `http://inmate-search.cobbsheriff.org/InmDetails.asp?soid=${encodeURIComponent(paddedSoid)}`;
-
-        await page.goto(detailUrl, { waitUntil: 'domcontentloaded' });
-
-        await page.waitForTimeout(2000);
-
-        const detailData = await page.evaluate(() => {
-          const clean = s => (s || '').replace(/\s+/g, ' ').trim();
-
-          const fullText = clean(document.body ? document.body.innerText : '');
-
-          const rows = Array.from(document.querySelectorAll('table tr'))
-            .map(row =>
-              Array.from(row.querySelectorAll('td, th'))
-                .map(c => clean(c.innerText))
-                .filter(Boolean)
-            )
-            .filter(r => r.length > 0);
-
-          return { fullText, rows };
-        });
-
-        detailedResults.push({
-          basic: inmate,
-          detail: detailData
-        });
-
-      } catch (err) {
-        console.log(`[scrape] Detail error for ${inmate.name}: ${err.message}`);
-      }
-    }
-
     await browser.close();
 
+    // ✅ If no rows found
+    if (!inmateRows || inmateRows.length === 0) {
+      return res.json({
+        found: false,
+        name,
+        mode,
+        pageUrl: currentUrl,
+        htmlLength,
+        debugPreview: html.substring(0, 1000),
+        message: 'No matching records OR blocked page',
+        scrapedAt: new Date().toISOString()
+      });
+    }
+
+    // ✅ If rows found
     return res.json({
       found: true,
       name,
       mode,
-      totalFound: inmates.length,
-      returnedDetails: detailedResults.length,
-      scrapedAt: new Date().toISOString(),
-      inmates: detailedResults
+      totalFound: inmateRows.length,
+      inmates: inmateRows,
+      pageUrl: currentUrl,
+      htmlLength,
+      scrapedAt: new Date().toISOString()
     });
 
   } catch (err) {
-    console.error('[scrape] Fatal error:', err.message);
+    console.error('[DEBUG] Fatal error:', err.message);
 
     if (browser) {
       try { await browser.close(); } catch (_) {}
     }
 
-    return res.status(500).json({
+    // 🚫 DO NOT crash n8n
+    return res.json({
+      found: false,
       error: err.message,
+      message: 'Scraper error but workflow continues',
       scrapedAt: new Date().toISOString()
     });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Cobb inquiry scraper running on port ${PORT}`);
+  console.log(`Cobb DEBUG scraper running on port ${PORT}`);
 });
