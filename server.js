@@ -8,78 +8,94 @@ const PORT = process.env.PORT || 3000;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'cobb-inquiry-scraper' });
+  res.json({ status: 'ok', service: 'cobb-inmate-scraper' });
 });
 
 app.post('/scrape', async (req, res) => {
-  if (AUTH_TOKEN) {
-    const provided = req.headers['x-auth-token'] || req.query.token;
-    if (provided !== AUTH_TOKEN)
-      return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  const { name } = req.body;
-  if (!name) return res.status(400).json({ error: 'name is required' });
-
-  let browser;
-
   try {
-    browser = await chromium.launch({
+    // 🔐 AUTH CHECK
+    if (AUTH_TOKEN) {
+      const provided = req.headers['x-auth-token'] || req.query.token;
+      if (provided !== AUTH_TOKEN) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+    }
+
+    const { name, mode = 'Inquiry' } = req.body;
+    if (!name) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+
+    console.log(`[scrape] Searching ${mode} for: ${name}`);
+
+    const browser = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
     });
 
     const context = await browser.newContext({
       userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121 Safari/537.36'
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121 Safari/537.36',
     });
 
     const page = await context.newPage();
 
-    console.log(`[scrape] Searching Inquiry for: ${name}`);
-
-    // Load form page
+    // 🔹 Load search page
     await page.goto(
       'http://inmate-search.cobbsheriff.org/enter_name.shtm',
-      { waitUntil: 'domcontentloaded' }
+      { waitUntil: 'domcontentloaded', timeout: 60000 }
     );
 
-    // Fill name
+    // 🔹 Fill name
     await page.fill('input[name="inmate_name"]', name);
 
-    // Force Inquiry mode
-    await page.selectOption('select[name="qry"]', 'Inquiry');
+    // 🔹 Select dropdown (In Custody / Inquiry)
+    await page.selectOption('select[name="qry"]', mode);
 
-    // Click search
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
-      page.click('input[value="Search"]')
-    ]);
+    // 🔹 Click search
+    await page.click('input[value="Search"]');
 
-    // Scroll down
-    await page.evaluate(() => {
-      window.scrollTo(0, document.body.scrollHeight);
-    });
+    // 🔹 Wait for results to load (NOT navigation)
+    await page.waitForFunction(() => {
+      return document.querySelectorAll('table tr').length > 1
+        || document.body.innerText.includes('No matching records');
+    }, { timeout: 60000 });
 
-    // Extract inmate list
+    // 🔹 Check if no records
+    const noRecords = await page.evaluate(() =>
+      document.body.innerText.includes('No matching records')
+    );
+
+    if (noRecords) {
+      await browser.close();
+      return res.json({
+        found: false,
+        name,
+        mode,
+        message: 'No matching records found',
+        scrapedAt: new Date().toISOString()
+      });
+    }
+
+    // 🔹 Collect inmate rows
     const inmates = await page.evaluate(() => {
       const rows = Array.from(document.querySelectorAll('table tr'));
       const results = [];
 
       for (const row of rows) {
-        const cells = Array.from(row.querySelectorAll('td')).map(td =>
-          td.innerText.trim()
+        const cells = Array.from(row.querySelectorAll('td')).map(c =>
+          c.innerText.trim()
         );
 
-        if (cells.length >= 7 && /^\d{9}$/.test(cells[6] || '')) {
+        if (cells.length >= 6 && /^\d{9}$/.test(cells[6] || '')) {
           results.push({
-            name: cells[1],
-            dob: cells[2],
-            race: cells[3],
-            sex: cells[4],
-            location: cells[5],
-            soid: cells[6],
-            daysInCustody: cells[7]
+            name: cells[1] || '',
+            dob: cells[2] || '',
+            race: cells[3] || '',
+            sex: cells[4] || '',
+            location: cells[5] || '',
+            soid: cells[6] || '',
+            daysInCustody: cells[7] || ''
           });
         }
       }
@@ -87,19 +103,11 @@ app.post('/scrape', async (req, res) => {
       return results;
     });
 
-    if (!inmates.length) {
-      await browser.close();
-      return res.json({
-        found: false,
-        message: 'No results found',
-        name
-      });
-    }
-
     console.log(`[scrape] Found ${inmates.length} inmates`);
 
     const detailedResults = [];
 
+    // 🔹 Visit each detail page
     for (const inmate of inmates) {
       try {
         const paddedSoid = inmate.soid + '    ';
@@ -107,35 +115,34 @@ app.post('/scrape', async (req, res) => {
         const detailUrl =
           `http://inmate-search.cobbsheriff.org/InmDetails.asp?soid=${encodeURIComponent(paddedSoid)}`;
 
-        const detailPage = await context.newPage();
-        await detailPage.goto(detailUrl, {
-          waitUntil: 'domcontentloaded'
+        await page.goto(detailUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000
         });
 
-        const pageData = await detailPage.evaluate(() => {
+        const detailData = await page.evaluate(() => {
           const clean = s => (s || '').replace(/\s+/g, ' ').trim();
 
           const fullText = clean(document.body.innerText);
 
-          const allRows = Array.from(
-            document.querySelectorAll('table tr')
-          ).map(row =>
-            Array.from(row.querySelectorAll('td, th'))
-              .map(c => clean(c.innerText))
-              .filter(Boolean)
-          ).filter(r => r.length > 0);
+          const rows = Array.from(document.querySelectorAll('table tr'))
+            .map(row =>
+              Array.from(row.querySelectorAll('td, th'))
+                .map(c => clean(c.innerText))
+                .filter(c => c)
+            )
+            .filter(r => r.length > 0);
 
-          return { fullText, allRows };
+          return { fullText, rows };
         });
 
         detailedResults.push({
-          ...inmate,
-          detail: pageData
+          basic: inmate,
+          detail: detailData
         });
 
-        await detailPage.close();
       } catch (err) {
-        console.error(`[detail error] ${inmate.soid}:`, err.message);
+        console.log(`[scrape] Detail error for ${inmate.name}: ${err.message}`);
       }
     }
 
@@ -143,23 +150,22 @@ app.post('/scrape', async (req, res) => {
 
     return res.json({
       found: true,
-      total: detailedResults.length,
       name,
+      mode,
+      totalFound: inmates.length,
       scrapedAt: new Date().toISOString(),
-      results: detailedResults
+      inmates: detailedResults
     });
 
   } catch (err) {
-    if (browser) await browser.close().catch(() => {});
-    console.error('Fatal error:', err.message);
-
+    console.error('[scrape] Fatal error:', err.message);
     return res.status(500).json({
       error: err.message,
-      found: false
+      scrapedAt: new Date().toISOString()
     });
   }
 });
 
-app.listen(PORT, () =>
-  console.log(`Inquiry scraper running on port ${PORT}`)
-);
+app.listen(PORT, () => {
+  console.log(`Inquiry scraper running on port ${PORT}`);
+});
