@@ -5,33 +5,18 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 3000;
-const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
-
-app.get("/", (req, res) => {
-  res.json({ status: "ok", service: "cobb-inmate-scraper" });
-});
 
 app.post("/scrape", async (req, res) => {
   let browser;
 
   try {
-    if (AUTH_TOKEN) {
-      const provided =
-        req.headers["x-auth-token"] || req.query.token || "";
-      if (provided !== AUTH_TOKEN) {
-        return res.status(401).json({ error: "Unauthorized" });
-      }
-    }
-
     let { name, mode = "Inquiry" } = req.body;
 
-    if (!name || typeof name !== "string") {
+    if (!name) {
       return res.status(400).json({ error: "name is required" });
     }
 
     const cleanedName = name.replace(/^=/, "").trim();
-
-    console.log(`[SCRAPE] Searching ${mode} for: ${cleanedName}`);
 
     browser = await chromium.launch({
       headless: true,
@@ -51,15 +36,15 @@ app.post("/scrape", async (req, res) => {
     });
 
     const page = await context.newPage();
-    page.setDefaultTimeout(90000);
+    page.setDefaultTimeout(60000);
 
-    // Load search page
+    // Step 1: Load search page
     await page.goto(
       "http://inmate-search.cobbsheriff.org/enter_name.shtm",
       { waitUntil: "domcontentloaded" }
     );
 
-    // Fill form
+    // Step 2: Fill form
     await page.fill('input[name="inmate_name"]', cleanedName);
     await page.selectOption('select[name="qry"]', mode);
 
@@ -68,16 +53,16 @@ app.post("/scrape", async (req, res) => {
       page.evaluate(() => document.querySelector("form")?.submit())
     ]);
 
-    await page.waitForSelector("table tr", { timeout: 20000 });
+    await page.waitForSelector("table tr");
 
-    // Extract inmates + booking links
+    // Step 3: Extract inmates
     const inmates = await page.evaluate(() => {
       const rows = Array.from(document.querySelectorAll("table tr"));
       const results = [];
 
       for (const row of rows) {
-        const cells = Array.from(row.querySelectorAll("td"));
-        if (cells.length >= 9) {
+        const cells = row.querySelectorAll("td");
+        if (cells.length >= 7) {
           const name = cells[1]?.innerText?.trim();
           const dob = cells[2]?.innerText?.trim();
           const race = cells[3]?.innerText?.trim();
@@ -85,19 +70,8 @@ app.post("/scrape", async (req, res) => {
           const location = cells[5]?.innerText?.trim();
           const soid = cells[6]?.innerText?.trim();
 
-          // Find booking link inside row
-          const link = row.querySelector('a[href*="InmDetails.asp"]');
-
           if (name && soid) {
-            results.push({
-              name,
-              dob,
-              race,
-              sex,
-              location,
-              soid,
-              bookingUrl: link ? link.href : null
-            });
+            results.push({ name, dob, race, sex, location, soid });
           }
         }
       }
@@ -105,73 +79,49 @@ app.post("/scrape", async (req, res) => {
       return results;
     });
 
-    if (!inmates || inmates.length === 0) {
+    if (!inmates.length) {
       await browser.close();
-      return res.json({
-        found: false,
-        name: cleanedName,
-        mode,
-        message: "No matching records found",
-        scrapedAt: new Date().toISOString()
-      });
+      return res.json({ found: false });
     }
 
-    const firstInmate = inmates[0];
+    const first = inmates[0];
 
-    if (!firstInmate.bookingUrl) {
-      await browser.close();
-      return res.json({
-        found: true,
-        inmates,
-        bookingError: "Booking link not found",
-        scrapedAt: new Date().toISOString()
-      });
-    }
+    // 🔥 IMPORTANT: Pad SOID to 13 characters with spaces
+    const paddedSoid = first.soid.padEnd(13, " ");
 
-    console.log("Navigating to booking page:", firstInmate.bookingUrl);
+    const encodedSoid = encodeURIComponent(paddedSoid);
 
-    // Navigate directly to booking detail page
-    await page.goto(firstInmate.bookingUrl, {
-      waitUntil: "domcontentloaded"
-    });
+    const detailUrl = `http://inmate-search.cobbsheriff.org/InmDetails.asp?soid=${encodedSoid}`;
 
-    await page.waitForTimeout(4000);
+    console.log("Detail URL:", detailUrl);
 
-    const bookingDetails = await page.evaluate(() => {
-      const text = document.body.innerText;
-      return text;
+    // Step 4: Navigate directly to detail page
+    await page.goto(detailUrl, { waitUntil: "domcontentloaded" });
+
+    await page.waitForTimeout(3000);
+
+    const detailText = await page.evaluate(() => {
+      return document.body.innerText;
     });
 
     await browser.close();
 
     return res.json({
       found: true,
-      name: cleanedName,
-      mode,
-      totalFound: inmates.length,
       inmates,
-      bookingDetails: bookingDetails.substring(0, 6000),
-      scrapedAt: new Date().toISOString()
+      detailUrl,
+      bookingDetails: detailText.substring(0, 5000)
     });
 
   } catch (err) {
-    console.error("SCRAPER ERROR:", err.message);
-
-    if (browser) {
-      try {
-        await browser.close();
-      } catch (_) {}
-    }
-
+    if (browser) await browser.close();
     return res.json({
       found: false,
-      error: err.message,
-      message: "Scraper error but workflow continues",
-      scrapedAt: new Date().toISOString()
+      error: err.message
     });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Cobb scraper running on port ${PORT}`);
+  console.log("Cobb scraper running");
 });
