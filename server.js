@@ -24,13 +24,16 @@ app.post("/scrape", async (req, res) => {
       }
     }
 
-    const { name, mode = "Inquiry" } = req.body;
+    let { name, mode = "Inquiry" } = req.body;
 
     if (!name || typeof name !== "string") {
       return res.status(400).json({ error: "name is required" });
     }
 
-    console.log(`[SCRAPE] Searching ${mode} for: ${name}`);
+    // Clean input
+    const cleanedName = name.replace(/^=/, "").trim();
+
+    console.log(`[SCRAPE] Searching ${mode} for: ${cleanedName}`);
 
     browser = await chromium.launch({
       headless: true,
@@ -43,47 +46,42 @@ app.post("/scrape", async (req, res) => {
 
     const context = await browser.newContext({
       userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121 Safari/537.36",
+      extraHTTPHeaders: {
+        referer: "http://inmate-search.cobbsheriff.org/"
+      }
     });
 
     const page = await context.newPage();
     page.setDefaultTimeout(90000);
 
-    // Load search page
+    // Step 1: Load search page
     await page.goto(
       "http://inmate-search.cobbsheriff.org/enter_name.shtm",
       { waitUntil: "domcontentloaded" }
     );
 
-    // Fill form
-    await page.fill('input[name="inmate_name"]', name);
+    // Step 2: Fill search form
+    await page.fill('input[name="inmate_name"]', cleanedName);
     await page.selectOption('select[name="qry"]', mode);
 
-    // Submit form
-    await page.evaluate(() => {
-      const form = document.querySelector("form");
-      if (form) form.submit();
-    });
+    // Step 3: Submit form properly
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "domcontentloaded" }),
+      page.evaluate(() => document.querySelector("form")?.submit())
+    ]);
 
-    // Wait for results page to render
-    await page.waitForTimeout(8000);
+    // Step 4: Wait for results table
+    await page.waitForSelector("table tr", { timeout: 20000 });
 
-    const currentUrl = page.url();
-    const html = await page.content();
-    const htmlLength = html.length;
-
-    console.log("Page URL:", currentUrl);
-    console.log("HTML Length:", htmlLength);
-
-    // Extract table rows
-    const inmateRows = await page.evaluate(() => {
+    // Step 5: Extract inmate rows
+    const inmates = await page.evaluate(() => {
       const rows = Array.from(document.querySelectorAll("table tr"));
       const results = [];
 
       for (const row of rows) {
         const cells = Array.from(row.querySelectorAll("td"));
-
-        if (cells.length >= 7) {
+        if (cells.length >= 9) {
           const name = cells[1]?.innerText?.trim();
           const dob = cells[2]?.innerText?.trim();
           const race = cells[3]?.innerText?.trim();
@@ -91,7 +89,7 @@ app.post("/scrape", async (req, res) => {
           const location = cells[5]?.innerText?.trim();
           const soid = cells[6]?.innerText?.trim();
 
-          if (name && soid && soid.length >= 6) {
+          if (name && soid) {
             results.push({
               name,
               dob,
@@ -107,29 +105,60 @@ app.post("/scrape", async (req, res) => {
       return results;
     });
 
-    await browser.close();
-
-    if (!inmateRows || inmateRows.length === 0) {
+    if (!inmates || inmates.length === 0) {
+      await browser.close();
       return res.json({
         found: false,
-        name,
+        name: cleanedName,
         mode,
         message: "No matching records found",
         scrapedAt: new Date().toISOString()
       });
     }
 
+    // Step 6: Click correct Last Known Booking (first row match)
+    const bookingButton = page.locator('input[value="Last Known Booking"]').first();
+
+    if (await bookingButton.count() === 0) {
+      await browser.close();
+      return res.json({
+        found: true,
+        inmates,
+        bookingError: "Booking button not found",
+        scrapedAt: new Date().toISOString()
+      });
+    }
+
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60000 }),
+      bookingButton.click()
+    ]);
+
+    // Extra wait for legacy ASP page
+    await page.waitForTimeout(4000);
+
+    console.log("After click URL:", page.url());
+
+    // Step 7: Scrape booking details
+    const bookingDetails = await page.evaluate(() => {
+      const text = document.body.innerText;
+      return text;
+    });
+
+    await browser.close();
+
     return res.json({
       found: true,
-      name,
+      name: cleanedName,
       mode,
-      totalFound: inmateRows.length,
-      inmates: inmateRows,
+      totalFound: inmates.length,
+      inmates,
+      bookingDetails: bookingDetails.substring(0, 5000),
       scrapedAt: new Date().toISOString()
     });
 
   } catch (err) {
-    console.error("Fatal scraper error:", err.message);
+    console.error("SCRAPER ERROR:", err.message);
 
     if (browser) {
       try {
@@ -137,7 +166,6 @@ app.post("/scrape", async (req, res) => {
       } catch (_) {}
     }
 
-    // Return safe response so n8n continues
     return res.json({
       found: false,
       error: err.message,
