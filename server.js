@@ -12,6 +12,8 @@ app.get('/', (req, res) => {
 });
 
 app.post('/scrape', async (req, res) => {
+  let browser;
+
   try {
     // 🔐 AUTH CHECK
     if (AUTH_TOKEN) {
@@ -22,20 +24,25 @@ app.post('/scrape', async (req, res) => {
     }
 
     const { name, mode = 'Inquiry' } = req.body;
+
     if (!name) {
       return res.status(400).json({ error: 'name is required' });
     }
 
     console.log(`[scrape] Searching ${mode} for: ${name}`);
 
-    const browser = await chromium.launch({
+    browser = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage'
+      ]
     });
 
     const context = await browser.newContext({
       userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121 Safari/537.36'
     });
 
     const page = await context.newPage();
@@ -49,19 +56,24 @@ app.post('/scrape', async (req, res) => {
     // 🔹 Fill name
     await page.fill('input[name="inmate_name"]', name);
 
-    // 🔹 Select dropdown (In Custody / Inquiry)
+    // 🔹 Select dropdown
     await page.selectOption('select[name="qry"]', mode);
 
-    // 🔹 Click search
-    await page.click('input[value="Search"]');
+    // 🔹 Submit form directly (avoids button selector issues)
+    await page.evaluate(() => {
+      const form = document.querySelector('form');
+      if (form) form.submit();
+    });
 
-    // 🔹 Wait for results to load (NOT navigation)
+    // 🔹 Wait for results content (NOT navigation)
     await page.waitForFunction(() => {
-      return document.querySelectorAll('table tr').length > 1
-        || document.body.innerText.includes('No matching records');
-    }, { timeout: 60000 });
+      return (
+        document.querySelectorAll('table tr').length > 1 ||
+        document.body.innerText.includes('No matching records')
+      );
+    }, { timeout: 90000 });
 
-    // 🔹 Check if no records
+    // 🔹 Check no records
     const noRecords = await page.evaluate(() =>
       document.body.innerText.includes('No matching records')
     );
@@ -77,7 +89,7 @@ app.post('/scrape', async (req, res) => {
       });
     }
 
-    // 🔹 Collect inmate rows
+    // 🔹 Extract rows
     const inmates = await page.evaluate(() => {
       const rows = Array.from(document.querySelectorAll('table tr'));
       const results = [];
@@ -111,7 +123,6 @@ app.post('/scrape', async (req, res) => {
     for (const inmate of inmates) {
       try {
         const paddedSoid = inmate.soid + '    ';
-
         const detailUrl =
           `http://inmate-search.cobbsheriff.org/InmDetails.asp?soid=${encodeURIComponent(paddedSoid)}`;
 
@@ -129,7 +140,7 @@ app.post('/scrape', async (req, res) => {
             .map(row =>
               Array.from(row.querySelectorAll('td, th'))
                 .map(c => clean(c.innerText))
-                .filter(c => c)
+                .filter(Boolean)
             )
             .filter(r => r.length > 0);
 
@@ -142,7 +153,9 @@ app.post('/scrape', async (req, res) => {
         });
 
       } catch (err) {
-        console.log(`[scrape] Detail error for ${inmate.name}: ${err.message}`);
+        console.log(
+          `[scrape] Detail error for ${inmate.name}: ${err.message}`
+        );
       }
     }
 
@@ -159,6 +172,11 @@ app.post('/scrape', async (req, res) => {
 
   } catch (err) {
     console.error('[scrape] Fatal error:', err.message);
+
+    if (browser) {
+      try { await browser.close(); } catch (_) {}
+    }
+
     return res.status(500).json({
       error: err.message,
       scrapedAt: new Date().toISOString()
@@ -167,5 +185,5 @@ app.post('/scrape', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Inquiry scraper running on port ${PORT}`);
+  console.log(`Cobb inquiry scraper running on port ${PORT}`);
 });
